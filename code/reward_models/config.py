@@ -45,6 +45,9 @@ class Config(BaseModel):
     use_wandb: bool = True
     skip_demo: bool = False
 
+    # Checkpointing
+    save_checkpoint: str | None = None
+
     @model_validator(mode="after")
     def validate_config(self):
         if self.lr_scheduler not in ("linear_decay", "warmup_only"):

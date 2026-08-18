@@ -4,12 +4,15 @@
 import argparse
 import json
 import os
+from functools import partial
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 from datasets import load_dataset
 from rich.console import Console
 from transformers import (
+    AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoTokenizer,
     GenerationConfig,
@@ -150,17 +153,24 @@ def score_rollouts(
     completions: list[list[str]],
     cfg: Config,
     console: Console,
+    build_ids,
+    extract_scores,
+    task_label: str = "Scoring rollouts",
 ) -> list[list[float]]:
-    """Score every (prompt, completion) pair and return an (M, N) reward matrix."""
+    """Score every (prompt, completion) pair and return an (M, N) reward matrix.
+
+    ``build_ids(question, completion)`` returns the token ids for one pair;
+    ``extract_scores(rm, input_ids, attention_mask)`` returns a list of scores
+    for a batch. This keeps the batching/padding/looping logic in one place
+    while letting the AceMath and ORM paths differ only in how they build and
+    read a batch.
+    """
     # Pre-tokenize all pairs, then length-sort so each batch has similar
     # sequence lengths and minimal padding waste.
     flat: list[tuple[int, int, list[int]]] = []
     for i, prompt in enumerate(prompts):
         for j, completion in enumerate(completions[i]):
-            chat_str = _build_scoring_chat(prompt["question"], completion, rm_tokenizer)
-            # Chat template already inserts special tokens; encoding with
-            # add_special_tokens=True would double-prepend them.
-            ids = rm_tokenizer.encode(chat_str, add_special_tokens=False)
+            ids = build_ids(prompt["question"], completion)
             flat.append((i, j, ids))
     flat.sort(key=lambda item: len(item[2]))
 
@@ -173,7 +183,7 @@ def score_rollouts(
 
     with progress_bar(console) as progress:
         total_batches = (len(flat) + cfg.score_batch_size - 1) // cfg.score_batch_size
-        task = progress.add_task("Scoring rollouts", total=total_batches)
+        task = progress.add_task(task_label, total=total_batches)
 
         for start in range(0, len(flat), cfg.score_batch_size):
             batch = flat[start : start + cfg.score_batch_size]
@@ -191,8 +201,7 @@ def score_rollouts(
                 attention_mask[row, pad_len:] = 1
 
             with torch.no_grad():
-                outputs = rm(input_ids=input_ids, attention_mask=attention_mask)
-            scores = outputs.logits[:, 0].float().cpu().tolist()
+                scores = extract_scores(rm, input_ids, attention_mask)
 
             for (prompt_idx, completion_idx, _), score in zip(batch, scores, strict=True):
                 rewards[prompt_idx][completion_idx] = score
@@ -200,6 +209,88 @@ def score_rollouts(
             progress.update(task, advance=1)
 
     return rewards
+
+
+def _acemath_build_ids(question: str, completion: str, tokenizer) -> list[int]:
+    """Tokenize a pair for the AceMath sequence-classification path."""
+    chat_str = _build_scoring_chat(question, completion, tokenizer)
+    # Chat template already inserts special tokens; encoding with
+    # add_special_tokens=True would double-prepend them.
+    return tokenizer.encode(chat_str, add_special_tokens=False)
+
+
+def _acemath_extract_scores(rm, input_ids, attention_mask) -> list[float]:
+    """Read the single-scalar regression head output for a batch."""
+    outputs = rm(input_ids=input_ids, attention_mask=attention_mask)
+    return outputs.logits[:, 0].float().cpu().tolist()
+
+
+def _orm_build_ids(question: str, completion: str, tokenizer) -> list[int]:
+    """Tokenize a pair for the ORM `Question:...\nAnswer:` path."""
+    return tokenizer.encode(
+        _build_orm_scoring_prompt(question, completion), add_special_tokens=True
+    )
+
+
+def _orm_extract_scores(rm, input_ids, attention_mask) -> list[float]:
+    """Read the ORM's last-token sigmoid as the reward for a batch."""
+    logits = rm(input_ids=input_ids, attention_mask=attention_mask)
+    last_idx = attention_mask.sum(dim=1) - 1
+    return torch.sigmoid(logits.gather(1, last_idx.unsqueeze(1)).squeeze(1)).float().cpu().tolist()
+
+
+def _is_orm_checkpoint(model_name: str) -> bool:
+    """True if ``model_name`` points at a saved ORM checkpoint."""
+    marker = Path(model_name) / "orm_checkpoint.json"
+    return marker.exists()
+
+
+def load_orm_reward_model(cfg: Config, device: torch.device):
+    """Load a saved ORM (causal LM + linear head) as the reward model."""
+    ckpt_dir = Path(cfg.reward_model_name)
+    attn_impl = get_attn_implementation()
+    tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    backbone = AutoModelForCausalLM.from_pretrained(
+        ckpt_dir,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation=attn_impl,
+    )
+    backbone.config.use_cache = False
+    backbone = backbone.to(device)
+
+    head = nn.Linear(backbone.config.hidden_size, 1, bias=False)
+    head.load_state_dict(torch.load(ckpt_dir / "head.pt", map_location=device))
+    head = head.to(torch.bfloat16).to(device)
+
+    class _OrmRewardModel(nn.Module):
+        def __init__(self, backbone, head):
+            super().__init__()
+            self.backbone = backbone
+            self.head = head
+
+        def forward(self, input_ids, attention_mask):
+            outputs = self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+                return_dict=True,
+            )
+            logits = self.head(outputs.hidden_states[-1]).squeeze(-1)
+            return logits
+
+    model = _OrmRewardModel(backbone, head)
+    model.eval()
+    return model, tokenizer
+
+
+def _build_orm_scoring_prompt(question: str, completion: str) -> str:
+    """Build the ORM's `Question:...\nAnswer:` prompt-completion string."""
+    return f"Question: {question}\nAnswer: {completion}"
 
 
 def rollouts_path(cfg: Config) -> Path:
@@ -282,10 +373,33 @@ def run(cfg: Config) -> Path:
     # Stage 2: scoring.
     rm_device = resolve_device(cfg.reward_model_device_id, cfg.device)
     console.print(f"[dim]Stage 2: loading reward model ({cfg.reward_model_name})[/dim]")
-    rm, rm_tokenizer = load_reward_model(cfg, rm_device)
+    if _is_orm_checkpoint(cfg.reward_model_name):
+        console.print("[dim]Detected ORM checkpoint — using ORM scoring path.[/dim]")
+        rm, rm_tokenizer = load_orm_reward_model(cfg, rm_device)
+        rewards = score_rollouts(
+            rm,
+            rm_tokenizer,
+            prompts,
+            completions,
+            cfg,
+            console,
+            build_ids=partial(_orm_build_ids, tokenizer=rm_tokenizer),
+            extract_scores=_orm_extract_scores,
+            task_label="Scoring rollouts (ORM)",
+        )
+    else:
+        rm, rm_tokenizer = load_reward_model(cfg, rm_device)
+        rewards = score_rollouts(
+            rm,
+            rm_tokenizer,
+            prompts,
+            completions,
+            cfg,
+            console,
+            build_ids=partial(_acemath_build_ids, tokenizer=rm_tokenizer),
+            extract_scores=_acemath_extract_scores,
+        )
     console.print(f"[dim]VRAM after reward-model load: {cuda_memory_gb():.2f} GB[/dim]")
-
-    rewards = score_rollouts(rm, rm_tokenizer, prompts, completions, cfg, console)
 
     del rm, rm_tokenizer
     free_memory()

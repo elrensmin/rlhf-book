@@ -20,7 +20,9 @@ Usage:
 """
 
 import argparse
+import json
 import random
+from pathlib import Path
 from typing import Dict, List
 
 import torch
@@ -460,8 +462,34 @@ def train_orm(
             log_metrics({**val_metrics, "epoch": epoch}, step=global_step)
             model.train()
 
+    if config.save_checkpoint:
+        tokenizer = load_tokenizer(config.model_id)
+        save_orm_checkpoint(model, tokenizer, config.save_checkpoint)
+
     finish_wandb()
     return model
+
+
+def save_orm_checkpoint(
+    model: OutcomeRewardModel,
+    tokenizer: AutoTokenizer,
+    checkpoint_dir: str,
+) -> None:
+    """Persist a trained ORM so it can be reused as a reward model later.
+
+    Saves the backbone (causal LM), the reward head, and the tokenizer, plus a
+    marker file so the rejection-sampling pipeline can detect and load this
+    checkpoint as an ORM rather than a standard sequence-classification model.
+    """
+    path = Path(checkpoint_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    model.model.save_pretrained(path)
+    tokenizer.save_pretrained(path)
+    torch.save(model.head.state_dict(), path / "head.pt")
+    marker = {"type": "orm", "model_id": model.model.config._name_or_path}
+    with open(path / "orm_checkpoint.json", "w") as f:
+        json.dump(marker, f)
+    print(f"Saved ORM checkpoint to {path}")
 
 
 # =============================================================================

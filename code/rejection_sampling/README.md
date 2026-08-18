@@ -23,24 +23,24 @@ the reward or a coin flip.
 
 ## Selection strategies
 
-| Strategy            | Config                           | What it keeps                                                               | Intuition |
-|---------------------|----------------------------------|-----------------------------------------------------------------------------|-----------|
-| `top_per_prompt`    | `configs/top_per_prompt.yaml`    | Argmax-reward completion per prompt (M pairs).                              | Classic RS: one chosen completion per question, covering every prompt in the train set. |
-| `random_per_prompt` | `configs/random_per_prompt.yaml` | One completion per prompt picked uniformly at random (M pairs). Seeded by `cfg.seed`. | Fair control for `top_per_prompt`: same dataset size, same prompt coverage, but ignores the reward model. |
-| `top_k_overall`     | `configs/top_k_overall.yaml`     | Top-K completions across the full M × N matrix (K pairs).                   | Lets the reward model concentrate training data on the easiest-to-score prompts. Can pick multiple completions from the same prompt. |
-| `random_k_overall`  | `configs/random_k_overall.yaml`  | K pairs sampled uniformly at random from the flat M × N pool. Same `top_k` as `top_k_overall`. Seeded by `cfg.seed`. | Fair control for `top_k_overall`: same sample budget, same flat structure, but ignores the reward model. |
+| Strategy            | Config                           | What it keeps                                                                                                        | Intuition                                                                                                                            |
+| ------------------- | -------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `top_per_prompt`    | `configs/top_per_prompt.yaml`    | Argmax-reward completion per prompt (M pairs).                                                                       | Classic RS: one chosen completion per question, covering every prompt in the train set.                                              |
+| `random_per_prompt` | `configs/random_per_prompt.yaml` | One completion per prompt picked uniformly at random (M pairs). Seeded by `cfg.seed`.                                | Fair control for `top_per_prompt`: same dataset size, same prompt coverage, but ignores the reward model.                            |
+| `top_k_overall`     | `configs/top_k_overall.yaml`     | Top-K completions across the full M × N matrix (K pairs).                                                            | Lets the reward model concentrate training data on the easiest-to-score prompts. Can pick multiple completions from the same prompt. |
+| `random_k_overall`  | `configs/random_k_overall.yaml`  | K pairs sampled uniformly at random from the flat M × N pool. Same `top_k` as `top_k_overall`. Seeded by `cfg.seed`. | Fair control for `top_k_overall`: same sample budget, same flat structure, but ignores the reward model.                             |
 
 All four YAMLs share identical generation/scoring parameters so the Stage 1/2
 cache is shared across strategies — only the selection step differs.
 
 ## Reference Runs
 
-| Strategy | wandb | Status |
-|----------|-------|--------|
-| **top_per_prompt** | [rs_top_per_prompt_gsm8k](https://wandb.ai/rlhf-book/core/runs/ohm3xnga) | ✅ Completed |
+| Strategy              | wandb                                                                       | Status      |
+| --------------------- | --------------------------------------------------------------------------- | ----------- |
+| **top_per_prompt**    | [rs_top_per_prompt_gsm8k](https://wandb.ai/rlhf-book/core/runs/ohm3xnga)    | ✅ Completed |
 | **random_per_prompt** | [rs_random_per_prompt_gsm8k](https://wandb.ai/rlhf-book/core/runs/y3pbcla7) | ✅ Completed |
-| **top_k_overall** | [rs_top_k_overall_gsm8k](https://wandb.ai/rlhf-book/core/runs/w75hklzs) | ✅ Completed |
-| **random_k_overall** | [rs_random_k_overall_gsm8k](https://wandb.ai/rlhf-book/core/runs/egeyr1q3) | ✅ Completed |
+| **top_k_overall**     | [rs_top_k_overall_gsm8k](https://wandb.ai/rlhf-book/core/runs/w75hklzs)     | ✅ Completed |
+| **random_k_overall**  | [rs_random_k_overall_gsm8k](https://wandb.ai/rlhf-book/core/runs/egeyr1q3)  | ✅ Completed |
 
 ![Rejection sampling accuracy curves across the four reference runs](../images/wandb_rejection_sampling.png)
 
@@ -80,6 +80,24 @@ uv run python -m rejection_sampling.train \
 When W&B logging is enabled, the four runs land in your project as separate runs, each logging a
 `test_accuracy` scalar you can compare in the dashboard. Pair each selection
 method with its matched random baseline when reading the results.
+
+## Choice-axis ablation
+
+For a deeper exploration of *when* reward selection beats a matched random baseline, see the companion campaign at
+`rejection_sampling/ablations/`. It sweeps the key levers the chapter calls out, always in reward-vs-random pairs:
+
+| Exp | Variable                                                     | Matched pair                            |
+| --- | ------------------------------------------------------------ | --------------------------------------- |
+| E1  | `num_completions_per_prompt` ∈ {4, 8, 16}                    | `top_per_prompt` vs `random_per_prompt` |
+| E2  | `selection.top_k` ∈ {500, 1000, 2000}                        | `top_k_overall` vs `random_k_overall`   |
+| E3  | policy model size {1.7B, 0.6B}                               | `top_per_prompt` vs `random_per_prompt` |
+| E4  | reward model quality {AceMath-7B-RM, small self-trained ORM} | `top_per_prompt` vs `random_per_prompt` |
+
+(Temperature was considered as a diversity sweep but omitted from the default
+campaign because it is heavily confounded with completion quality)
+
+Run each config individually with `rejection_sampling.train`; see
+`rejection_sampling/ablations/README.md` for the exact commands.
 
 ## Cache mechanics
 
